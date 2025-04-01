@@ -113,39 +113,74 @@ function App() {
     try {
       cleanupConnection();
 
-      console.log('[WebRTC] Getting user media');
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: true,
-        audio: true
-      });
+      // 1. Получаем медиапоток с устройства
+      console.log('[WebRTC] Requesting user media');
+      let stream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            width: { ideal: 1280 },
+            height: { ideal: 720 }
+          },
+          audio: true
+        });
+        console.log('[WebRTC] Got media stream with tracks:', stream.getTracks().map(t => t.kind));
+      } catch (err) {
+        console.error('[WebRTC] Media access error:', err);
+        setConnectionError(`Camera/microphone access denied: ${err.message}`);
+        return;
+      }
 
+      // 2. Настраиваем локальное видео
       localStreamRef.current = stream;
       if (localVideoRef.current) {
         localVideoRef.current.srcObject = stream;
+        localVideoRef.current.onloadedmetadata = () => {
+          console.log('[WebRTC] Local video metadata loaded');
+          localVideoRef.current.play().catch(e =>
+              console.error('[WebRTC] Local video play error:', e));
+        };
       }
 
-      console.log('[WebRTC] Creating new peer connection');
+      // 3. Создаем PeerConnection
+      console.log('[WebRTC] Creating peer connection');
       const peer = new SimplePeer({
         initiator: true,
         trickle: true,
         stream: stream,
         config: {
           iceServers: [
-            { urls: 'stun:stun.l.google.com:19302' }
-          ]
+            { urls: 'stun:stun.l.google.com:19302' },
+            // Добавьте TURN сервер если нужно:
+            // {
+            //   urls: 'turn:your-turn-server.com',
+            //   username: 'user',
+            //   credential: 'password'
+            // }
+          ],
+          iceTransportPolicy: 'all'
+        },
+        offerOptions: {
+          offerToReceiveAudio: 1,
+          offerToReceiveVideo: 1
         }
       });
 
+      // 4. Настройка обработчиков событий
       peer.on('error', (err) => {
-        console.error('[WebRTC] Error:', err);
+        console.error('[WebRTC] Peer error:', err);
         setConnectionError(`WebRTC error: ${err.message}`);
         cleanupConnection();
       });
 
       peer.on('signal', (data) => {
-        console.log('[WebRTC] Signaling data:', data);
+        console.log(`[WebRTC] Sending signal (${data.type})`);
         if (wsRef.current?.readyState === WebSocket.OPEN) {
-          wsRef.current.send(JSON.stringify(data));
+          wsRef.current.send(JSON.stringify({
+            type: data.type,
+            sdp: data.sdp,
+            candidate: data.candidate
+          }));
         }
       });
 
@@ -156,20 +191,33 @@ function App() {
       });
 
       peer.on('data', (data) => {
-        console.log('[WebRTC] Received data:', data.toString());
-        setReceived(data.toString());
+        const msg = data.toString();
+        console.log('[WebRTC] Received data:', msg);
+        setReceived(msg);
       });
 
-      peer.on('stream', (stream) => {
-        console.log('[WebRTC] Received remote stream');
+      peer.on('stream', (remoteStream) => {
+        console.log('[WebRTC] Received remote stream with tracks:',
+            remoteStream.getTracks().map(t => t.kind));
+
         if (remoteVideoRef.current) {
-          remoteVideoRef.current.srcObject = stream;
+          remoteVideoRef.current.srcObject = remoteStream;
+          remoteVideoRef.current.onloadedmetadata = () => {
+            console.log('[WebRTC] Remote video metadata loaded');
+            remoteVideoRef.current.play().catch(e =>
+                console.error('[WebRTC] Remote video play error:', e));
+          };
         }
       });
 
       peer.on('iceConnectionStateChange', () => {
-        console.log('[WebRTC] ICE state:', peer.iceConnectionState);
-        setIceState(peer.iceConnectionState);
+        const state = peer.iceConnectionState;
+        console.log('[WebRTC] ICE state changed:', state);
+        setIceState(state);
+
+        if (state === 'failed') {
+          setConnectionError('ICE connection failed. Check your network.');
+        }
       });
 
       peer.on('signalingStateChange', () => {
@@ -188,9 +236,10 @@ function App() {
       });
 
       peerRef.current = peer;
+
     } catch (err) {
-      console.error('Connection error:', err);
-      setConnectionError(`Failed to start connection: ${err.message}`);
+      console.error('[WebRTC] Connection setup error:', err);
+      setConnectionError(`Setup failed: ${err.message}`);
       cleanupConnection();
     }
   };
