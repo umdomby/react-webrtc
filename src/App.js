@@ -1,33 +1,44 @@
+// App.js
 import React, { useState, useEffect, useRef } from 'react';
 import SimplePeer from 'simple-peer';
-import MediaDevices from './MediaDevices';
 import './App.css';
+
+const DEBUG = true;
 
 function App() {
   const [message, setMessage] = useState('');
   const [received, setReceived] = useState('');
   const [isConnected, setIsConnected] = useState(false);
   const [connectionError, setConnectionError] = useState('');
+  const [iceConnectionState, setIceConnectionState] = useState('');
+  const [signalingState, setSignalingState] = useState('');
+  const [iceCandidates, setIceCandidates] = useState([]);
+
   const peerRef = useRef(null);
   const wsRef = useRef(null);
-  const [mediaStream, setMediaStream] = useState(null);
+  const localVideoRef = useRef(null);
+  const remoteVideoRef = useRef(null);
+
+  const log = (...args) => {
+    if (DEBUG) console.log(...args);
+  };
 
   useEffect(() => {
     const initWebSocket = () => {
-      wsRef.current = new WebSocket('ws://192.168.0.151:8080/ws');
+      wsRef.current = new WebSocket('ws://localhost:8080/ws');
 
       wsRef.current.onopen = () => {
-        console.log('WebSocket connected');
+        log('WebSocket connected');
         setConnectionError('');
       };
 
       wsRef.current.onclose = () => {
-        console.log('WebSocket disconnected');
+        log('WebSocket disconnected');
         cleanupConnection();
       };
 
       wsRef.current.onerror = (error) => {
-        console.error('WebSocket error:', error);
+        log('WebSocket error:', error);
         setConnectionError('WebSocket connection failed');
       };
 
@@ -45,94 +56,106 @@ function App() {
   const handleWebSocketMessage = (e) => {
     try {
       const data = JSON.parse(e.data);
-      console.log('Received WebSocket message:', data);
+      log('Received WebSocket message:', data);
 
       if (!peerRef.current) {
-        console.warn('Peer is not initialized');
+        log('Peer is not initialized, ignoring message');
         return;
       }
 
       if (data.type === 'answer') {
-        peerRef.current.signal(data.sdp);
+        log('Received answer SDP');
+        peerRef.current.signal(data);
       } else if (data.type === 'ice' && data.candidate) {
-        peerRef.current.signal(data.candidate);
+        log('Received ICE candidate:', data.candidate);
+        peerRef.current.signal({
+          candidate: data.candidate.candidate,
+          sdpMLineIndex: data.candidate.sdpMLineIndex,
+          sdpMid: data.candidate.sdpMid
+        });
       }
     } catch (err) {
-      console.error('Error processing WebSocket message:', err);
+      log('Error processing WebSocket message:', err);
     }
   };
 
   const cleanupConnection = () => {
     if (peerRef.current) {
+      log('Destroying peer connection');
       peerRef.current.destroy();
       peerRef.current = null;
     }
     setIsConnected(false);
-
-    if (mediaStream) {
-      mediaStream.getTracks().forEach(track => track.stop());
-      setMediaStream(null);
-    }
+    setIceConnectionState('');
+    setSignalingState('');
+    setIceCandidates([]);
   };
 
   const startConnection = async () => {
     try {
       cleanupConnection();
 
-      // Получаем медиапоток (если нужно)
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: true,
-        audio: true
-      });
-      setMediaStream(stream);
-
+      log('Creating new peer connection');
       const peer = new SimplePeer({
         initiator: true,
         trickle: true,
-        stream: stream,
         config: {
           iceServers: [
             { urls: 'stun:stun.l.google.com:19302' }
-          ]
+          ],
+          iceTransportPolicy: 'all'
         }
       });
 
+      peer.on('error', (err) => {
+        log('P2P error:', err);
+        setConnectionError(`Connection error: ${err.message}`);
+        cleanupConnection();
+      });
+
       peer.on('signal', (data) => {
-        console.log('Peer signal:', data);
+        log('Peer signal:', data);
         if (wsRef.current?.readyState === WebSocket.OPEN) {
           wsRef.current.send(JSON.stringify(data));
         }
       });
 
       peer.on('connect', () => {
+        log('P2P connected!');
         setIsConnected(true);
         setConnectionError('');
-        console.log('P2P connected!');
       });
 
       peer.on('data', (data) => {
+        log('Received data:', data.toString());
         setReceived(data.toString());
       });
 
-      peer.on('stream', (stream) => {
-        console.log('Received remote stream');
-        // Здесь можно обработать удаленный поток
+      peer.on('iceConnectionStateChange', () => {
+        const state = peer.iceConnectionState;
+        log('ICE connection state changed:', state);
+        setIceConnectionState(state);
       });
 
-      peer.on('error', (err) => {
-        console.error('P2P error:', err);
-        setConnectionError(`Connection error: ${err.message}`);
-        cleanupConnection();
+      peer.on('signalingStateChange', () => {
+        const state = peer.signalingState;
+        log('Signaling state changed:', state);
+        setSignalingState(state);
+      });
+
+      peer.on('iceCandidate', (candidate) => {
+        log('New ICE candidate:', candidate);
+        setIceCandidates(prev => [...prev, candidate]);
       });
 
       peer.on('close', () => {
-        console.log('P2P connection closed');
+        log('P2P connection closed');
         cleanupConnection();
       });
 
       peerRef.current = peer;
     } catch (err) {
-      console.error('Connection error:', err);
+      log('Connection error:', err);
       setConnectionError(`Failed to start connection: ${err.message}`);
       cleanupConnection();
     }
@@ -140,6 +163,7 @@ function App() {
 
   const sendMessage = () => {
     if (peerRef.current && isConnected) {
+      log('Sending message:', message);
       peerRef.current.send(message);
       setMessage('');
     }
@@ -148,20 +172,15 @@ function App() {
   return (
       <div className="App">
         <header className="App-header">
-          <h1>WebRTC Video Chat</h1>
+          <h1>WebRTC Debug Console</h1>
 
-          <div className="media-container">
-            <MediaDevices
-                mediaStream={mediaStream}
-                isConnected={isConnected}
-            />
+          <div className="video-container">
+            <video ref={localVideoRef} autoPlay playsInline muted className="local-video" />
+            <video ref={remoteVideoRef} autoPlay playsInline className="remote-video" />
           </div>
 
           <div className="controls">
-            <button
-                onClick={startConnection}
-                disabled={isConnected}
-            >
+            <button onClick={startConnection} disabled={isConnected}>
               {isConnected ? 'Connected' : 'Start Connection'}
             </button>
 
@@ -173,19 +192,31 @@ function App() {
                   disabled={!isConnected}
                   placeholder="Type your message"
               />
-              <button
-                  onClick={sendMessage}
-                  disabled={!isConnected}
-              >
+              <button onClick={sendMessage} disabled={!isConnected}>
                 Send
               </button>
             </div>
           </div>
 
           <div className="status">
-            <p>Status: {isConnected ? 'Connected' : 'Disconnected'}</p>
+            <h3>Connection Status</h3>
+            <p>WebSocket: {wsRef.current?.readyState === WebSocket.OPEN ? 'Connected' : 'Disconnected'}</p>
+            <p>WebRTC: {isConnected ? 'Connected' : 'Disconnected'}</p>
+            <p>ICE State: {iceConnectionState || 'N/A'}</p>
+            <p>Signaling State: {signalingState || 'N/A'}</p>
             <p>Received: {received || 'No messages yet'}</p>
             {connectionError && <p className="error">{connectionError}</p>}
+          </div>
+
+          <div className="ice-candidates">
+            <h3>ICE Candidates ({iceCandidates.length})</h3>
+            <div className="candidates-list">
+              {iceCandidates.map((candidate, i) => (
+                  <div key={i} className="candidate">
+                    {candidate.candidate}
+                  </div>
+              ))}
+            </div>
           </div>
         </header>
       </div>
