@@ -10,8 +10,6 @@ function App() {
   const [iceState, setIceState] = useState('');
   const [signalingState, setSignalingState] = useState('');
   const [iceCandidates, setIceCandidates] = useState([]);
-  const [devices, setDevices] = useState([]);
-  const [selectedDevice, setSelectedDevice] = useState('');
 
   const peerRef = useRef(null);
   const wsRef = useRef(null);
@@ -19,59 +17,67 @@ function App() {
   const remoteVideoRef = useRef(null);
   const localStreamRef = useRef(null);
 
-  // Получаем список медиаустройств
   useEffect(() => {
-    const getDevices = async () => {
-      try {
-        const devices = await navigator.mediaDevices.enumerateDevices();
-        const videoDevices = devices.filter(device => device.kind === 'videoinput');
-        setDevices(videoDevices);
-        if (videoDevices.length > 0) {
-          setSelectedDevice(videoDevices[0].deviceId);
-        }
-      } catch (err) {
-        console.error('Error enumerating devices:', err);
+    return () => {
+      if (localVideoRef.current) {
+        localVideoRef.current.srcObject = null;
+      }
+      if (remoteVideoRef.current) {
+        remoteVideoRef.current.srcObject = null;
       }
     };
-
-    getDevices();
   }, []);
 
-  // Инициализация WebSocket
   useEffect(() => {
     const ws = new WebSocket('ws://localhost:8080/ws');
 
     ws.onopen = () => {
-      console.log('WebSocket connected');
+      console.log('[WebSocket] Connected');
       setConnectionError('');
     };
 
     ws.onclose = () => {
-      console.log('WebSocket disconnected');
+      console.log('[WebSocket] Disconnected');
       cleanupConnection();
     };
 
     ws.onerror = (error) => {
-      console.error('WebSocket error:', error);
+      console.error('[WebSocket] Error:', error);
       setConnectionError('WebSocket connection failed');
     };
 
     ws.onmessage = (e) => {
       try {
         const data = JSON.parse(e.data);
-        console.log('Received WebSocket message:', data);
+        console.log('[WebSocket] Received message:', data);
 
         if (!peerRef.current) {
           console.warn('Peer is not initialized');
           return;
         }
 
+        if (data.type === 'ice') {
+          const candidate = new RTCIceCandidate({
+            candidate: data.candidate.candidate,
+            sdpMid: data.candidate.sdpMid || null,
+            sdpMLineIndex: data.candidate.sdpMLineIndex || null
+          });
+          peerRef.current.addIceCandidate(candidate).catch(console.error);
+        }
+
         if (data.type === 'answer') {
-          console.log('Received answer SDP');
-          peerRef.current.signal(data);
-        } else if (data.type === 'ice') {
-          console.log('Received ICE candidate:', data.candidate);
-          peerRef.current.signal(data.candidate);
+          console.log('[WebRTC] Received answer SDP');
+          peerRef.current.signal({
+            type: 'answer',
+            sdp: data.sdp
+          });
+        } else if (data.type === 'ice' && data.candidate) {
+          console.log('[WebRTC] Received ICE candidate:', data.candidate);
+          peerRef.current.signal({
+            candidate: data.candidate.candidate,
+            sdpMLineIndex: data.candidate.sdpMLineIndex,
+            sdpMid: data.candidate.sdpMid
+          });
         }
       } catch (err) {
         console.error('Error processing WebSocket message:', err);
@@ -88,6 +94,7 @@ function App() {
 
   const cleanupConnection = () => {
     if (peerRef.current) {
+      console.log('[WebRTC] Destroying peer connection');
       peerRef.current.destroy();
       peerRef.current = null;
     }
@@ -106,9 +113,9 @@ function App() {
     try {
       cleanupConnection();
 
-      // Получаем медиапоток с выбранного устройства
+      console.log('[WebRTC] Getting user media');
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: { deviceId: selectedDevice ? { exact: selectedDevice } : undefined },
+        video: true,
         audio: true
       });
 
@@ -117,7 +124,7 @@ function App() {
         localVideoRef.current.srcObject = stream;
       }
 
-      console.log('Creating new peer connection');
+      console.log('[WebRTC] Creating new peer connection');
       const peer = new SimplePeer({
         initiator: true,
         trickle: true,
@@ -130,53 +137,53 @@ function App() {
       });
 
       peer.on('error', (err) => {
-        console.error('P2P error:', err);
-        setConnectionError(`Connection error: ${err.message}`);
+        console.error('[WebRTC] Error:', err);
+        setConnectionError(`WebRTC error: ${err.message}`);
         cleanupConnection();
       });
 
       peer.on('signal', (data) => {
-        console.log('Peer signal:', data);
+        console.log('[WebRTC] Signaling data:', data);
         if (wsRef.current?.readyState === WebSocket.OPEN) {
           wsRef.current.send(JSON.stringify(data));
         }
       });
 
       peer.on('connect', () => {
-        console.log('P2P connected!');
+        console.log('[WebRTC] Peer connection established');
         setIsConnected(true);
         setConnectionError('');
       });
 
       peer.on('data', (data) => {
-        console.log('Received data:', data.toString());
+        console.log('[WebRTC] Received data:', data.toString());
         setReceived(data.toString());
       });
 
       peer.on('stream', (stream) => {
-        console.log('Received remote stream');
+        console.log('[WebRTC] Received remote stream');
         if (remoteVideoRef.current) {
           remoteVideoRef.current.srcObject = stream;
         }
       });
 
       peer.on('iceConnectionStateChange', () => {
-        console.log('ICE state:', peer.iceConnectionState);
+        console.log('[WebRTC] ICE state:', peer.iceConnectionState);
         setIceState(peer.iceConnectionState);
       });
 
       peer.on('signalingStateChange', () => {
-        console.log('Signaling state:', peer.signalingState);
+        console.log('[WebRTC] Signaling state:', peer.signalingState);
         setSignalingState(peer.signalingState);
       });
 
       peer.on('iceCandidate', (candidate) => {
-        console.log('ICE candidate:', candidate);
+        console.log('[WebRTC] New ICE candidate:', candidate);
         setIceCandidates(prev => [...prev, candidate]);
       });
 
       peer.on('close', () => {
-        console.log('P2P connection closed');
+        console.log('[WebRTC] Connection closed');
         cleanupConnection();
       });
 
@@ -190,14 +197,10 @@ function App() {
 
   const sendMessage = () => {
     if (peerRef.current && isConnected) {
-      console.log('Sending message:', message);
+      console.log('[WebRTC] Sending message:', message);
       peerRef.current.send(message);
       setMessage('');
     }
-  };
-
-  const handleDeviceChange = (e) => {
-    setSelectedDevice(e.target.value);
   };
 
   return (
@@ -206,42 +209,12 @@ function App() {
           <h1>WebRTC Video Chat</h1>
 
           <div className="video-container">
-            <video
-                ref={localVideoRef}
-                autoPlay
-                playsInline
-                muted
-                className="local-video"
-            />
-            <video
-                ref={remoteVideoRef}
-                autoPlay
-                playsInline
-                className="remote-video"
-            />
-          </div>
-
-          <div className="device-selector">
-            <label htmlFor="video-device">Camera:</label>
-            <select
-                id="video-device"
-                value={selectedDevice}
-                onChange={handleDeviceChange}
-                disabled={isConnected}
-            >
-              {devices.map(device => (
-                  <option key={device.deviceId} value={device.deviceId}>
-                    {device.label || `Camera ${device.deviceId.slice(0, 5)}`}
-                  </option>
-              ))}
-            </select>
+            <video ref={localVideoRef} autoPlay playsInline muted className="local-video" />
+            <video ref={remoteVideoRef} autoPlay playsInline className="remote-video" />
           </div>
 
           <div className="controls">
-            <button
-                onClick={startConnection}
-                disabled={isConnected || devices.length === 0}
-            >
+            <button onClick={startConnection} disabled={isConnected}>
               {isConnected ? 'Connected' : 'Start Connection'}
             </button>
 
@@ -253,10 +226,7 @@ function App() {
                   disabled={!isConnected}
                   placeholder="Type your message"
               />
-              <button
-                  onClick={sendMessage}
-                  disabled={!isConnected}
-              >
+              <button onClick={sendMessage} disabled={!isConnected}>
                 Send
               </button>
             </div>
