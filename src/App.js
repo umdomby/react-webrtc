@@ -44,7 +44,8 @@ function App() {
   // Подключение WebSocket
   useEffect(() => {
     const connect = () => {
-      const wsUrl = process.env.REACT_APP_WS_URL || 'ws://localhost:8080/ws';
+      //const wsUrl = process.env.REACT_APP_WS_URL || 'ws://localhost:8080/ws';
+      const wsUrl = 'ws://localhost:8080/ws';
       const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
 
