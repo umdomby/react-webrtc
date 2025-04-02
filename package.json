@@ -12,6 +12,7 @@
   },
   "scripts": {
     "start": "react-app-rewired start",
+    "start2": "HTTPS=true SSL_CRT_FILE=localhost.pem SSL_KEY_FILE=localhost-key.pem react-scripts start",
     "build": "react-app-rewired build",
     "test": "react-app-rewired test",
     "eject": "react-scripts eject"
