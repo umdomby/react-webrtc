@@ -16,6 +16,8 @@ function App() {
   const [audioDevices, setAudioDevices] = useState([]);
   const [selectedVideo, setSelectedVideo] = useState('');
   const [selectedAudio, setSelectedAudio] = useState('');
+  const [dataChannel, setDataChannel] = useState(null);
+  const [isCallStarted, setIsCallStarted] = useState(false);
 
   const localVideoRef = useRef(null);
   const remoteVideoRef = useRef(null);
@@ -45,49 +47,68 @@ function App() {
     getDevices();
   }, []);
 
-  // Подключение к WebSocket серверу
+  // Подключение к WebSocket серверу с переподключением
   useEffect(() => {
-    const websocket = new WebSocket('ws://localhost:8080/ws');
+    let websocket;
+    let reconnectAttempts = 0;
+    const maxReconnectAttempts = 5;
+    const reconnectDelay = 3000;
 
-    websocket.onopen = () => {
-      addToDebugLog('WebSocket connected');
-      setStatus('Connected (waiting for call)');
-      setWs(websocket);
-    };
+    const connectWebSocket = () => {
+      websocket = new WebSocket('ws://localhost:8080/ws');
 
-    websocket.onclose = () => {
-      addToDebugLog('WebSocket disconnected');
-      setStatus('Disconnected');
-      setError('WebSocket connection closed');
-    };
+      websocket.onopen = () => {
+        addToDebugLog('WebSocket connected');
+        setStatus('Connected (waiting for call)');
+        setWs(websocket);
+        reconnectAttempts = 0;
+      };
 
-    websocket.onerror = (err) => {
-      addToDebugLog(`WebSocket error: ${err.message}`);
-      setError(`WebSocket error: ${err.message}`);
-    };
-
-    websocket.onmessage = async (event) => {
-      try {
-        const data = JSON.parse(event.data);
-        addToDebugLog(`Received message: ${JSON.stringify(data)}`);
-
-        if (data.type === 'answer') {
-          await handleAnswer(data.sdp);
-        } else if (data.type === 'ice') {
-          await handleRemoteICE(data.candidate);
+      websocket.onclose = (event) => {
+        if (event.code !== 1000 && reconnectAttempts < maxReconnectAttempts) {
+          addToDebugLog(`WebSocket disconnected, attempting to reconnect (${reconnectAttempts + 1}/${maxReconnectAttempts})`);
+          setStatus(`Disconnected, reconnecting... (${reconnectAttempts + 1}/${maxReconnectAttempts})`);
+          setTimeout(connectWebSocket, reconnectDelay);
+          reconnectAttempts++;
+        } else {
+          addToDebugLog('WebSocket disconnected permanently');
+          setStatus('Disconnected');
+          setError('WebSocket connection closed');
         }
-      } catch (err) {
-        addToDebugLog(`Error processing message: ${err.message}`);
-        setError(`Message error: ${err.message}`);
-      }
+      };
+
+      websocket.onerror = (err) => {
+        addToDebugLog(`WebSocket error: ${err.message || 'Unknown error'}`);
+        setError(`WebSocket error: ${err.message || 'Unknown error'}`);
+      };
+
+      websocket.onmessage = async (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          addToDebugLog(`Received message: ${JSON.stringify(data)}`);
+
+          if (data.type === 'answer') {
+            await handleAnswer(data.sdp);
+          } else if (data.type === 'ice') {
+            await handleRemoteICE(data.candidate);
+          }
+        } catch (err) {
+          addToDebugLog(`Error processing message: ${err.message}`);
+          setError(`Message error: ${err.message}`);
+        }
+      };
     };
+
+    connectWebSocket();
 
     return () => {
-      if (websocket) websocket.close();
+      if (websocket) {
+        websocket.close(1000, 'Normal closure');
+      }
     };
   }, []);
 
-  // Инициализация локального потока при изменении выбранных устройств
+  // Инициализация локального потока
   useEffect(() => {
     if (selectedVideo || selectedAudio) {
       initLocalStream();
@@ -131,47 +152,63 @@ function App() {
     try {
       const config = {
         iceServers: [
-          { urls: 'stun:stun.l.google.com:19302' },
           {
-            urls: 'turn:213.184.249.66:3478',
+            urls: [
+              'turn:213.184.249.66:3478?transport=udp',
+              'turn:213.184.249.66:3478?transport=tcp',
+              'turns:213.184.249.66:5349'
+            ],
             username: 'user1',
             credential: 'pass1'
           },
-          {
-            urls: 'turns:213.184.249.66:5349',
-            username: 'user1',
-            credential: 'pass1'
-          }
+          { urls: 'stun:stun.l.google.com:19302' }
         ],
-        iceTransportPolicy: 'all'
+        iceTransportPolicy: 'all',
+        bundlePolicy: 'max-bundle',
+        rtcpMuxPolicy: 'require',
+        iceCandidatePoolSize: 0
       };
 
       const peerConnection = new RTCPeerConnection(config);
       setPc(peerConnection);
-      addToDebugLog('PeerConnection created');
+      addToDebugLog('PeerConnection created with TURN servers');
 
       // Обработчики событий PeerConnection
       peerConnection.onicecandidate = (event) => {
         if (event.candidate) {
           addToDebugLog(`New ICE candidate: ${JSON.stringify(event.candidate)}`);
           setIceCandidates(prev => [...prev, event.candidate]);
-          ws.send(JSON.stringify({
-            type: 'ice',
-            candidate: event.candidate
-          }));
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+              type: 'ice',
+              candidate: event.candidate
+            }));
+          } else {
+            addToDebugLog('Cannot send ICE candidate - WebSocket not ready');
+          }
         } else {
           addToDebugLog('ICE gathering complete');
         }
       };
 
       peerConnection.oniceconnectionstatechange = () => {
-        addToDebugLog(`ICE connection state: ${peerConnection.iceConnectionState}`);
-        setStatus(`ICE state: ${peerConnection.iceConnectionState}`);
+        const state = peerConnection.iceConnectionState;
+        addToDebugLog(`ICE connection state: ${state}`);
+        setStatus(`ICE state: ${state}`);
+
+        if (state === 'failed') {
+          addToDebugLog('ICE connection failed, restarting ICE...');
+          peerConnection.restartIce();
+        }
       };
 
       peerConnection.onconnectionstatechange = () => {
         addToDebugLog(`Connection state: ${peerConnection.connectionState}`);
         setStatus(`Connection state: ${peerConnection.connectionState}`);
+      };
+
+      peerConnection.onsignalingstatechange = () => {
+        addToDebugLog(`Signaling state: ${peerConnection.signalingState}`);
       };
 
       peerConnection.ontrack = (event) => {
@@ -184,7 +221,7 @@ function App() {
         }
       };
 
-      // Добавляем локальный поток если он есть
+      // Добавляем локальный поток
       if (localStream) {
         localStream.getTracks().forEach(track => {
           peerConnection.addTrack(track, localStream);
@@ -192,18 +229,29 @@ function App() {
         addToDebugLog('Added local tracks to PeerConnection');
       }
 
-      // Создаем data channel для чата
-      const dataChannel = peerConnection.createDataChannel('chat');
-      dataChannel.onopen = () => {
+      // Создаем DataChannel для чата
+      const dc = peerConnection.createDataChannel('chat', {
+        ordered: true,
+        maxPacketLifeTime: 3000
+      });
+      setDataChannel(dc);
+
+      dc.onopen = () => {
         addToDebugLog('Data channel opened');
         setStatus('Data channel ready');
       };
-      dataChannel.onmessage = (event) => {
+
+      dc.onmessage = (event) => {
         addToDebugLog(`Received message: ${event.data}`);
         setChatMessages(prev => [...prev, `Remote: ${event.data}`]);
       };
-      dataChannel.onclose = () => {
+
+      dc.onclose = () => {
         addToDebugLog('Data channel closed');
+      };
+
+      dc.onerror = (error) => {
+        addToDebugLog(`Data channel error: ${error}`);
       };
 
       return peerConnection;
@@ -215,25 +263,40 @@ function App() {
   };
 
   const startCall = async () => {
+    if (isCallStarted) return;
+
     try {
+      setIsCallStarted(true);
       setStatus('Starting call...');
       addToDebugLog('Starting call');
 
       const peerConnection = createPeerConnection();
       if (!peerConnection) return;
 
-      const offer = await peerConnection.createOffer();
+      const offerOptions = {
+        offerToReceiveAudio: 1,
+        offerToReceiveVideo: 1
+      };
+
+      const offer = await peerConnection.createOffer(offerOptions);
       addToDebugLog(`Created offer: ${offer.sdp}`);
+
+      // Устанавливаем локальное описание перед отправкой offer
       await peerConnection.setLocalDescription(offer);
       addToDebugLog('Set local description');
 
-      ws.send(JSON.stringify({
-        type: 'offer',
-        sdp: offer.sdp
-      }));
-
-      setStatus('Call started - waiting for answer');
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({
+          type: 'offer',
+          sdp: offer.sdp
+        }));
+        setStatus('Call started - waiting for answer');
+      } else {
+        addToDebugLog('Cannot send offer - WebSocket not ready');
+        setError('WebSocket connection not ready');
+      }
     } catch (err) {
+      setIsCallStarted(false);
       addToDebugLog(`Error starting call: ${err.message}`);
       setError(`Call error: ${err.message}`);
     }
@@ -275,24 +338,13 @@ function App() {
   };
 
   const sendMessage = () => {
-    if (!pc || !message.trim()) return;
+    if (!dataChannel || dataChannel.readyState !== 'open' || !message.trim()) return;
 
     try {
-      const dataChannel = pc.getSenders()
-          .find(sender => sender.transceiver &&
-              sender.transceiver.receiver &&
-              sender.transceiver.receiver.track)
-          ?.transceiver.receiver.transport.dataChannel;
-
-      if (dataChannel && dataChannel.readyState === 'open') {
-        dataChannel.send(message);
-        setChatMessages(prev => [...prev, `You: ${message}`]);
-        setMessage('');
-        addToDebugLog(`Sent message: ${message}`);
-      } else {
-        addToDebugLog('Data channel not ready');
-        setError('Data channel not ready');
-      }
+      dataChannel.send(message);
+      setChatMessages(prev => [...prev, `You: ${message}`]);
+      setMessage('');
+      addToDebugLog(`Sent message: ${message}`);
     } catch (err) {
       addToDebugLog(`Error sending message: ${err.message}`);
       setError(`Message send error: ${err.message}`);
@@ -300,6 +352,8 @@ function App() {
   };
 
   const endCall = () => {
+    setIsCallStarted(false);
+
     if (pc) {
       pc.close();
       setPc(null);
@@ -310,6 +364,10 @@ function App() {
       remoteVideoRef.current.srcObject.getTracks().forEach(track => track.stop());
       remoteVideoRef.current.srcObject = null;
       setRemoteStream(null);
+    }
+
+    if (dataChannel) {
+      setDataChannel(null);
     }
 
     setStatus('Disconnected');
@@ -371,10 +429,16 @@ function App() {
             </div>
 
             <div className="button-group">
-              <button onClick={startCall} disabled={!localStream || !ws}>
+              <button
+                  onClick={startCall}
+                  disabled={!localStream || !ws || isCallStarted}
+              >
                 Start Call
               </button>
-              <button onClick={endCall} disabled={!pc}>
+              <button
+                  onClick={endCall}
+                  disabled={!pc}
+              >
                 End Call
               </button>
             </div>
@@ -386,9 +450,12 @@ function App() {
                   onChange={(e) => setMessage(e.target.value)}
                   placeholder="Type a message"
                   onKeyPress={(e) => e.key === 'Enter' && sendMessage()}
-                  disabled={!pc}
+                  disabled={!dataChannel || dataChannel.readyState !== 'open'}
               />
-              <button onClick={sendMessage} disabled={!pc || !message.trim()}>
+              <button
+                  onClick={sendMessage}
+                  disabled={!dataChannel || dataChannel.readyState !== 'open' || !message.trim()}
+              >
                 Send
               </button>
             </div>
